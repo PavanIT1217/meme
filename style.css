@@ -1,0 +1,85 @@
+:root {
+  --bg: #f6f6f8;
+  --surface: #ffffff;
+  --text: #1c1c22;
+  --muted: #6b6b76;
+  --border: #e2e2e8;
+  --accent: #6c3cf5;
+  --accent-text: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121216;
+    --surface: #1d1d23;
+    --text: #ececf1;
+    --muted: #9a9aa6;
+    --border: #2e2e37;
+    --accent: #8f6bff;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+main { max-width: 1200px; margin: 0 auto; padding: 0 16px 32px; }
+.topbar { max-width: 1200px; margin: 0 auto; padding: 24px 16px 12px; }
+.topbar h1 { margin: 0; font-size: 28px; letter-spacing: -0.5px; }
+.tag { margin: 4px 0 0; color: var(--muted); }
+footer { text-align: center; color: var(--muted); font-size: 13px; padding: 24px 16px; }
+footer a { color: inherit; }
+
+.btn {
+  font: inherit; cursor: pointer; border-radius: 8px; padding: 9px 14px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+}
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+.btn.link { border: none; background: none; padding: 8px 0; color: var(--accent); }
+.btn:hover { filter: brightness(0.96); }
+
+.gallery-controls { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0; }
+#search {
+  flex: 1 1 260px; font: inherit; padding: 9px 12px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+}
+.status { color: var(--muted); min-height: 1.5em; }
+
+.gallery {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+}
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  overflow: hidden; cursor: pointer; padding: 0; text-align: left; color: inherit; font: inherit;
+  transition: transform .1s, box-shadow .1s;
+}
+.card:hover, .card:focus-visible { transform: translateY(-2px); box-shadow: 0 4px 14px rgba(0,0,0,.12); }
+.card img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; background: var(--border); }
+.card span { display: block; padding: 8px 10px; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.editor { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 20px; align-items: start; }
+@media (max-width: 800px) { .editor { grid-template-columns: 1fr; } }
+.canvas-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+#canvas { display: block; max-width: 100%; max-height: 75vh; margin: 0 auto; touch-action: none; cursor: grab; }
+#canvas.dragging { cursor: grabbing; }
+.hint { text-align: center; color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.panel h2 { margin: 0 0 12px; font-size: 17px; }
+.layer { display: flex; gap: 6px; margin-bottom: 8px; align-items: flex-start; }
+.layer textarea {
+  flex: 1; font: inherit; resize: vertical; min-height: 40px; padding: 6px 8px;
+  border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
+}
+.layer.active textarea { border-color: var(--accent); }
+.layer input[type=range] { width: 70px; }
+.layer .col { display: flex; flex-direction: column; gap: 4px; align-items: center; font-size: 11px; color: var(--muted); }
+.layer .remove { padding: 2px 8px; }
+fieldset { border: 1px solid var(--border); border-radius: 8px; margin: 16px 0; padding: 8px 12px 12px; }
+legend { color: var(--muted); font-size: 13px; padding: 0 4px; }
+fieldset label { display: flex; justify-content: space-between; align-items: center; margin: 8px 0; gap: 8px; }
+fieldset select { font: inherit; padding: 4px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+fieldset .check { justify-content: flex-start; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
