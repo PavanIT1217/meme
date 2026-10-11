@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config controls how the server stores data and identifies itself.
@@ -23,7 +24,10 @@ type Config struct {
 	Admins        []string // usernames that may delete any template or meme
 	BaseURL       string   // public URL, e.g. https://memes.example.com (optional)
 	SecureCookies bool     // set the Secure flag on session cookies (use behind HTTPS)
-	Static        fs.FS    // frontend files
+	TrustProxy    bool     // take client IPs from X-Forwarded-For (only behind a reverse proxy)
+	Google        GoogleConfig
+	Limits        Limits
+	Static        fs.FS // frontend files
 }
 
 type Server struct {
@@ -32,6 +36,7 @@ type Server struct {
 	admins    map[string]bool
 	handler   http.Handler
 	shareTmpl *template.Template
+	limit     limiters
 }
 
 func New(cfg Config) (*Server, error) {
@@ -50,6 +55,13 @@ func New(cfg Config) (*Server, error) {
 		db:        db,
 		admins:    map[string]bool{},
 		shareTmpl: template.Must(template.New("share").Parse(sharePageHTML)),
+		limit: limiters{
+			api:      newLimiter(cfg.Limits.API, time.Now),
+			auth:     newLimiter(cfg.Limits.Auth, time.Now),
+			write:    newLimiter(cfg.Limits.Write, time.Now),
+			meme:     newLimiter(cfg.Limits.Meme, time.Now),
+			template: newLimiter(cfg.Limits.Template, time.Now),
+		},
 	}
 	for _, a := range cfg.Admins {
 		if a = strings.ToLower(strings.TrimSpace(a)); a != "" {
@@ -67,26 +79,33 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.S
 func (s *Server) routes() http.Handler {
 	m := http.NewServeMux()
 
-	m.HandleFunc("POST /api/auth/register", s.handleRegister)
-	m.HandleFunc("POST /api/auth/login", s.handleLogin)
+	// write wraps an authenticated, rate-limited (per user) handler.
+	write := func(l *limiter, h func(http.ResponseWriter, *http.Request, *User)) http.HandlerFunc {
+		return s.requireUser(limitUser(l, h))
+	}
+	lim := s.limit
+
+	m.HandleFunc("GET /auth/google/login", s.limitIP(lim.auth, s.handleGoogleLogin))
+	m.HandleFunc("GET /auth/google/callback", s.handleGoogleCallback) // needs a state cookie from the limited login step
 	m.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	m.HandleFunc("GET /api/me", s.handleMe)
+	m.HandleFunc("PATCH /api/me", write(lim.write, s.handleUpdateMe))
 	m.HandleFunc("GET /api/me/memes", s.requireUser(s.handleMyMemes))
 
 	m.HandleFunc("GET /api/templates", s.handleListTemplates)
-	m.HandleFunc("POST /api/templates", s.requireUser(s.handleCreateTemplate))
+	m.HandleFunc("POST /api/templates", write(lim.template, s.handleCreateTemplate))
 	m.HandleFunc("GET /api/templates/{id}", s.handleGetTemplate)
-	m.HandleFunc("DELETE /api/templates/{id}", s.requireUser(s.handleDeleteTemplate))
-	m.HandleFunc("PUT /api/templates/{id}/favorite", s.requireUser(s.handleFavorite(true)))
-	m.HandleFunc("DELETE /api/templates/{id}/favorite", s.requireUser(s.handleFavorite(false)))
+	m.HandleFunc("DELETE /api/templates/{id}", write(lim.write, s.handleDeleteTemplate))
+	m.HandleFunc("PUT /api/templates/{id}/favorite", write(lim.write, s.handleFavorite(true)))
+	m.HandleFunc("DELETE /api/templates/{id}/favorite", write(lim.write, s.handleFavorite(false)))
 	m.HandleFunc("GET /api/tags", s.handleTags)
 
 	m.HandleFunc("GET /api/memes", s.handleListMemes)
-	m.HandleFunc("POST /api/memes", s.requireUser(s.handleCreateMeme))
+	m.HandleFunc("POST /api/memes", write(lim.meme, s.handleCreateMeme))
 	m.HandleFunc("GET /api/memes/{id}", s.handleGetMeme)
-	m.HandleFunc("DELETE /api/memes/{id}", s.requireUser(s.handleDeleteMeme))
-	m.HandleFunc("PUT /api/memes/{id}/like", s.requireUser(s.handleLike(true)))
-	m.HandleFunc("DELETE /api/memes/{id}/like", s.requireUser(s.handleLike(false)))
+	m.HandleFunc("DELETE /api/memes/{id}", write(lim.write, s.handleDeleteMeme))
+	m.HandleFunc("PUT /api/memes/{id}/like", write(lim.write, s.handleLike(true)))
+	m.HandleFunc("DELETE /api/memes/{id}/like", write(lim.write, s.handleLike(false)))
 
 	m.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
@@ -116,6 +135,13 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+
+		if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/auth/") {
+			if ok, wait := s.limit.api.allow(s.clientIP(r)); !ok {
+				tooManyRequests(w, wait)
+				return
+			}
+		}
 
 		// CSRF defence in addition to SameSite cookies: state-changing requests
 		// from a browser must come from our own origin.

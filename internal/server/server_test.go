@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"image"
 	"image/png"
@@ -10,22 +11,33 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 )
 
-func newTestServer(t *testing.T, admins ...string) *httptest.Server {
+func newTestServer(t *testing.T, opts ...func(*Config)) *httptest.Server {
 	t.Helper()
 	dir := t.TempDir()
-	s, err := New(Config{
+	google := fakeGoogle(t)
+	cfg := Config{
 		DBPath:    filepath.Join(dir, "test.db"),
 		UploadDir: filepath.Join(dir, "uploads"),
-		Admins:    admins,
 		Static:    fstest.MapFS{"index.html": {Data: []byte("<h1>home</h1>")}},
-	})
+		Limits:    DefaultLimits(),
+		Google: GoogleConfig{
+			ClientID: "test-client", ClientSecret: "test-secret",
+			AuthURL: google.URL + "/auth", TokenURL: google.URL + "/token", UserInfoURL: google.URL + "/userinfo",
+		},
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	s, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +46,37 @@ func newTestServer(t *testing.T, admins ...string) *httptest.Server {
 	return ts
 }
 
-// client is a logged-in (or anonymous) browser-like client with its own cookie jar.
+func withAdmins(names ...string) func(*Config) { return func(c *Config) { c.Admins = names } }
+
+// fakeGoogle is a minimal OAuth provider. The authorization "code" is the base64 JSON
+// of the Google profile to sign in as; the token endpoint echoes it back as the access token.
+func fakeGoogle(t *testing.T) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /token", func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		if r.Form.Get("client_secret") != "test-secret" || r.Form.Get("code_verifier") == "" {
+			t.Errorf("token request missing client secret or PKCE verifier: %v", r.Form)
+			http.Error(w, `{"error":"invalid_request"}`, 400)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"access_token": r.Form.Get("code"), "token_type": "Bearer", "expires_in": 3600})
+	})
+	mux.HandleFunc("GET /userinfo", func(w http.ResponseWriter, r *http.Request) {
+		raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		if err != nil {
+			http.Error(w, "bad token", 401)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(raw)
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// client is a browser-like client with its own cookie jar. It does not follow redirects.
 type client struct {
 	t    *testing.T
 	base string
@@ -43,7 +85,20 @@ type client struct {
 
 func newClient(t *testing.T, ts *httptest.Server) *client {
 	jar, _ := cookiejar.New(nil)
-	return &client{t: t, base: ts.URL, http: &http.Client{Jar: jar}}
+	return &client{t: t, base: ts.URL, http: &http.Client{
+		Jar:           jar,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}}
+}
+
+func (c *client) get(path string) *http.Response {
+	c.t.Helper()
+	res, err := c.http.Get(c.base + path)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	res.Body.Close()
+	return res
 }
 
 func (c *client) do(method, path string, body io.Reader, contentType string) (int, map[string]any) {
@@ -83,12 +138,47 @@ func (c *client) upload(path string, img []byte, fields map[string]string) (int,
 	return c.do("POST", path, &buf, mw.FormDataContentType())
 }
 
-func (c *client) register(name string) {
+// startGoogleLogin follows /auth/google/login and returns the provider redirect URL.
+func (c *client) startGoogleLogin(next string) *url.URL {
 	c.t.Helper()
-	code, out := c.json("POST", "/api/auth/register", map[string]string{"username": name, "password": "correct horse"})
-	if code != http.StatusCreated {
-		c.t.Fatalf("register %s: %d %v", name, code, out)
+	res := c.get("/auth/google/login?next=" + url.QueryEscape(next))
+	if res.StatusCode != http.StatusFound {
+		c.t.Fatalf("login start: status %d", res.StatusCode)
 	}
+	loc, _ := url.Parse(res.Header.Get("Location"))
+	return loc
+}
+
+func googleCode(g googleUser) string {
+	b, _ := json.Marshal(g)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// loginAs completes the Google sign-in flow as the given profile and returns the final redirect.
+func (c *client) loginAs(g googleUser, next string) string {
+	c.t.Helper()
+	loc := c.startGoogleLogin(next)
+	res := c.get("/auth/google/callback?state=" + url.QueryEscape(loc.Query().Get("state")) + "&code=" + googleCode(g))
+	if res.StatusCode != http.StatusFound {
+		c.t.Fatalf("callback: status %d", res.StatusCode)
+	}
+	return res.Header.Get("Location")
+}
+
+// login signs in as a Google user whose display name (and thus username) is name.
+func (c *client) login(name string) {
+	c.t.Helper()
+	c.loginAs(googleUser{Sub: "sub-" + name, Name: name, Email: name + "@example.com"}, "/")
+	if u := c.me(); u == nil || u["username"] != name {
+		c.t.Fatalf("login %s: got user %v", name, u)
+	}
+}
+
+func (c *client) me() map[string]any {
+	c.t.Helper()
+	_, out := c.json("GET", "/api/me", nil)
+	u, _ := out["user"].(map[string]any)
+	return u
 }
 
 func pngBytes(w, h int) []byte {
@@ -104,50 +194,116 @@ func expect(t *testing.T, what string, got, want int, body map[string]any) {
 	}
 }
 
-func TestAuthFlow(t *testing.T) {
+func TestGoogleLogin(t *testing.T) {
 	ts := newTestServer(t)
 	c := newClient(t, ts)
 
-	code, out := c.json("GET", "/api/me", nil)
-	expect(t, "me anon", code, 200, out)
-	if out["user"] != nil {
-		t.Fatalf("expected no user, got %v", out["user"])
+	_, out := c.json("GET", "/api/me", nil)
+	if out["user"] != nil || out["google_login"] != true {
+		t.Fatalf("anonymous /api/me: %v", out)
 	}
 
-	code, out = c.json("POST", "/api/auth/register", map[string]string{"username": "ab", "password": "correct horse"})
-	expect(t, "short username", code, 400, out)
-	code, out = c.json("POST", "/api/auth/register", map[string]string{"username": "alice", "password": "short"})
-	expect(t, "short password", code, 400, out)
-
-	c.register("alice")
-	code, out = c.json("GET", "/api/me", nil)
-	expect(t, "me", code, 200, out)
-	if out["user"].(map[string]any)["username"] != "alice" {
-		t.Fatalf("unexpected user %v", out)
+	// The redirect to Google carries PKCE, our callback URL and a state value.
+	loc := c.startGoogleLogin("/#/feed")
+	q := loc.Query()
+	if q.Get("code_challenge_method") != "S256" || q.Get("code_challenge") == "" || q.Get("state") == "" ||
+		q.Get("redirect_uri") != ts.URL+"/auth/google/callback" || q.Get("client_id") != "test-client" {
+		t.Fatalf("bad authorization URL: %s", loc)
 	}
 
-	other := newClient(t, ts)
-	code, out = other.json("POST", "/api/auth/register", map[string]string{"username": "ALICE", "password": "correct horse"})
-	expect(t, "duplicate username (case-insensitive)", code, 409, out)
+	// A callback with the wrong state is rejected and does not sign in.
+	res := c.get("/auth/google/callback?state=forged&code=" + googleCode(googleUser{Sub: "1", Name: "Mallory"}))
+	if res.Header.Get("Location") != "/?login=failed" || c.me() != nil {
+		t.Fatalf("forged state accepted: %v", res.Header)
+	}
+	// The state cookie is single use: replaying the old state fails too.
+	res = c.get("/auth/google/callback?state=" + q.Get("state") + "&code=" + googleCode(googleUser{Sub: "1", Name: "Mallory"}))
+	if res.Header.Get("Location") != "/?login=failed" {
+		t.Fatalf("state replay accepted: %v", res.Header)
+	}
+
+	alice := googleUser{Sub: "google-alice", Name: "Alice Smith", Email: "alice@example.com", Picture: "https://example.com/a.png"}
+	if next := c.loginAs(alice, "/#/feed"); next != "/#/feed" {
+		t.Fatalf("redirect after login: %q", next)
+	}
+	u := c.me()
+	if u["username"] != "Alice_Smith" || u["avatar_url"] != "https://example.com/a.png" {
+		t.Fatalf("new user: %v", u)
+	}
+	id := u["id"]
+
+	// Signing in again with the same Google account reuses the account.
+	c2 := newClient(t, ts)
+	c2.loginAs(alice, "/")
+	if c2.me()["id"] != id {
+		t.Fatalf("second sign-in created a new account: %v", c2.me())
+	}
+
+	// Another person with the same name gets a distinct username.
+	c3 := newClient(t, ts)
+	c3.loginAs(googleUser{Sub: "google-alice-2", Name: "Alice Smith"}, "/")
+	if other := c3.me(); other["id"] == id || !strings.HasPrefix(other["username"].(string), "Alice_Smith_") {
+		t.Fatalf("name clash: %v", other)
+	}
+
+	// Open redirects are not allowed.
+	if next := newClient(t, ts).loginAs(googleUser{Sub: "x", Name: "Xavier"}, "//evil.example"); next != "/" {
+		t.Fatalf("open redirect: %q", next)
+	}
+
+	// Renaming.
+	code, out := c.json("PATCH", "/api/me", map[string]string{"username": "a!"})
+	expect(t, "invalid rename", code, 400, out)
+	code, out = c3.json("PATCH", "/api/me", map[string]string{"username": "alice_smith"})
+	expect(t, "rename to taken name (case-insensitive)", code, 409, out)
+	code, out = c.json("PATCH", "/api/me", map[string]string{"username": "alice"})
+	expect(t, "rename", code, 200, out)
 
 	code, out = c.json("POST", "/api/auth/logout", nil)
 	expect(t, "logout", code, 200, out)
-	code, out = c.json("GET", "/api/me", nil)
-	if out["user"] != nil {
-		t.Fatalf("still logged in after logout: %v", out)
+	if c.me() != nil {
+		t.Fatal("still signed in after logout")
 	}
+}
 
-	code, out = c.json("POST", "/api/auth/login", map[string]string{"username": "alice", "password": "wrong password"})
-	expect(t, "bad login", code, 401, out)
-	code, out = c.json("POST", "/api/auth/login", map[string]string{"username": "alice", "password": "correct horse"})
-	expect(t, "login", code, 200, out)
+func TestGoogleLoginDisabled(t *testing.T) {
+	ts := newTestServer(t, func(c *Config) { c.Google = GoogleConfig{} })
+	c := newClient(t, ts)
+	if res := c.get("/auth/google/login"); res.StatusCode != http.StatusNotFound {
+		t.Fatalf("login without config: %d", res.StatusCode)
+	}
+	if _, out := c.json("GET", "/api/me", nil); out["google_login"] != false {
+		t.Fatalf("google_login flag: %v", out)
+	}
+}
+
+func TestUsernameBase(t *testing.T) {
+	cases := map[[2]string]string{
+		{"José Ñandú", ""}:                      "Jos_and",
+		{"李", "li.wei@example.com"}:             "li_wei",
+		{"", "x@example.com"}:                   "",
+		{"A Very Long Display Name Indeed", ""}: "A_Very_Long_Display_Name",
+	}
+	for in, want := range cases {
+		got := usernameBase(in[0], in[1])
+		if want == "" {
+			if !strings.HasPrefix(got, "user_") {
+				t.Errorf("usernameBase(%q,%q) = %q, want user_NNNN", in[0], in[1], got)
+			}
+		} else if got != want {
+			t.Errorf("usernameBase(%q,%q) = %q, want %q", in[0], in[1], got, want)
+		}
+		if !usernameRe.MatchString(got) {
+			t.Errorf("usernameBase(%q,%q) = %q is not a valid username", in[0], in[1], got)
+		}
+	}
 }
 
 func TestTemplatesAndFavorites(t *testing.T) {
 	ts := newTestServer(t)
 	alice, bob, anon := newClient(t, ts), newClient(t, ts), newClient(t, ts)
-	alice.register("alice")
-	bob.register("bob")
+	alice.login("alice")
+	bob.login("bob")
 
 	code, out := anon.upload("/api/templates", pngBytes(10, 10), map[string]string{"name": "x"})
 	expect(t, "anon upload", code, 401, out)
@@ -210,11 +366,11 @@ func TestTemplatesAndFavorites(t *testing.T) {
 }
 
 func TestMemesFeedAndLikes(t *testing.T) {
-	ts := newTestServer(t, "mod")
+	ts := newTestServer(t, withAdmins("mod"))
 	alice, bob, mod, anon := newClient(t, ts), newClient(t, ts), newClient(t, ts), newClient(t, ts)
-	alice.register("alice")
-	bob.register("bob")
-	mod.register("mod")
+	alice.login("alice")
+	bob.login("bob")
+	mod.login("mod")
 
 	_, tmpl := alice.upload("/api/templates", pngBytes(20, 20), map[string]string{"name": "Base"})
 	tmplID := itoa(int(tmpl["id"].(float64)))
@@ -292,8 +448,7 @@ func TestMemesFeedAndLikes(t *testing.T) {
 
 func TestCrossOriginRejected(t *testing.T) {
 	ts := newTestServer(t)
-	req, _ := http.NewRequest("POST", ts.URL+"/api/auth/register",
-		strings.NewReader(`{"username":"mallory","password":"correct horse"}`))
+	req, _ := http.NewRequest("POST", ts.URL+"/api/auth/logout", nil)
 	req.Header.Set("Origin", "https://evil.example")
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -318,3 +473,86 @@ func TestStaticAndUnknownAPI(t *testing.T) {
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }
+
+func TestLimiter(t *testing.T) {
+	clock := time.Unix(1_000_000, 0)
+	l := newLimiter(Limit{Events: 1, Per: time.Second, Burst: 2}, func() time.Time { return clock })
+	for i := 0; i < 2; i++ {
+		if ok, _ := l.allow("a"); !ok {
+			t.Fatalf("burst request %d denied", i)
+		}
+	}
+	ok, wait := l.allow("a")
+	if ok || wait <= 0 || wait > time.Second {
+		t.Fatalf("over limit: ok=%v wait=%v", ok, wait)
+	}
+	if ok, _ := l.allow("b"); !ok {
+		t.Fatal("keys must be independent")
+	}
+	clock = clock.Add(time.Second)
+	if ok, _ := l.allow("a"); !ok {
+		t.Fatal("token not refilled after 1s")
+	}
+	clock = clock.Add(time.Hour) // the sweep drops idle, full buckets
+	l.allow("c")
+	if len(l.buckets) != 1 {
+		t.Fatalf("idle buckets not swept: %d left", len(l.buckets))
+	}
+	if ok, _ := (*limiter)(nil).allow("x"); !ok {
+		t.Fatal("nil limiter (zero Limit) must allow everything")
+	}
+}
+
+func TestRateLimits(t *testing.T) {
+	ts := newTestServer(t, func(c *Config) {
+		c.Limits.Meme = Limit{Events: 2, Per: time.Hour, Burst: 2}
+	})
+	alice, bob := newClient(t, ts), newClient(t, ts)
+	alice.login("alice")
+	bob.login("bob")
+	for i := 0; i < 2; i++ {
+		code, out := alice.upload("/api/memes", pngBytes(10, 10), nil)
+		expect(t, "meme within limit", code, 201, out)
+	}
+	code, out := alice.upload("/api/memes", pngBytes(10, 10), nil)
+	expect(t, "meme over limit", code, 429, out)
+	if !strings.Contains(out["error"].(string), "min") {
+		t.Fatalf("error should say when to retry: %v", out)
+	}
+	code, out = bob.upload("/api/memes", pngBytes(10, 10), nil)
+	expect(t, "limits are per user", code, 201, out)
+}
+
+func TestAPIRateLimitPerIP(t *testing.T) {
+	ts := newTestServer(t, func(c *Config) {
+		c.Limits.API = Limit{Events: 3, Per: time.Minute, Burst: 3}
+	})
+	c := newClient(t, ts)
+	for i := 0; i < 3; i++ {
+		code, out := c.json("GET", "/api/tags", nil)
+		expect(t, "within limit", code, 200, out)
+	}
+	res, err := http.Get(ts.URL + "/api/tags")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusTooManyRequests || res.Header.Get("Retry-After") == "" {
+		t.Fatalf("over limit: %d, Retry-After=%q", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+	// Static pages are not API-limited.
+	if res, _ := http.Get(ts.URL + "/"); res.StatusCode != 200 {
+		t.Fatalf("static page limited: %d", res.StatusCode)
+	}
+}
+
+func TestClientIP(t *testing.T) {
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:1234"
+	r.Header.Set("X-Forwarded-For", "6.6.6.6, 203.0.113.9")
+	if ip := (&Server{}).clientIP(r); ip != "10.0.0.1" {
+		t.Fatalf("untrusted proxy header used: %s", ip)
+	}
+	if ip := (&Server{cfg: Config{TrustProxy: true}}).clientIP(r); ip != "203.0.113.9" {
+		t.Fatalf("trusted proxy: got %s, want right-most entry", ip)
+	}
+}

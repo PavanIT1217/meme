@@ -148,3 +148,15 @@ dialog .segmented { margin-bottom: 8px; }
 .share-page img { max-width: 100%; height: auto; border-radius: 10px; border: 1px solid var(--border); }
 .share-page .meta { color: var(--muted); }
 .share-page .actions { justify-content: center; }
+
+/* Account */
+.avatar { width: 28px; height: 28px; border-radius: 50%; object-fit: cover; }
+.btn.link.username { color: var(--text); font-weight: 600; padding: 0; }
+.btn.google { display: inline-flex; align-items: center; gap: 8px; font-weight: 500; }
+
+/* Notices (sign-in errors, rate limits, …) */
+.notice {
+  position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 10;
+  max-width: calc(100vw - 32px); margin: 0; padding: 10px 16px; border-radius: 8px;
+  background: var(--text); color: var(--bg); box-shadow: 0 4px 14px rgba(0,0,0,.2);
+}

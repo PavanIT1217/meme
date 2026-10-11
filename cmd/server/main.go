@@ -56,12 +56,22 @@ func main() {
 		Admins:        admins,
 		BaseURL:       baseURL,
 		SecureCookies: strings.HasPrefix(baseURL, "https://") || os.Getenv("SECURE_COOKIES") == "1",
-		Static:        static,
+		TrustProxy:    os.Getenv("TRUST_PROXY") == "1",
+		Google: server.GoogleConfig{
+			ClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
+			ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
+		},
+		Limits: server.DefaultLimits(),
+		Static: static,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer srv.Close()
+
+	if os.Getenv("GOOGLE_CLIENT_ID") == "" || os.Getenv("GOOGLE_CLIENT_SECRET") == "" {
+		log.Print("GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set: sign-in is disabled (browsing still works)")
+	}
 
 	if *seed {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

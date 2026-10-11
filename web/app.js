@@ -25,58 +25,63 @@
     return data;
   }
 
-  // ---------- Auth ----------
+  // ---------- Notices ----------
+  let noticeTimer;
+  function notice(msg) {
+    const n = $('notice');
+    n.textContent = msg;
+    n.hidden = false;
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => { n.hidden = true; }, 6000);
+  }
+
+  // ---------- Auth (Google) ----------
   let user = null;
-  let afterLogin = null; // action to resume once the user logs in
+  let googleLogin = false;
 
   function setUser(u) {
     user = u;
     document.querySelectorAll('.auth-only').forEach((n) => { n.hidden = !user; });
     document.querySelectorAll('.anon-only').forEach((n) => { n.hidden = !!user; });
     $('whoami').textContent = user ? user.username : '';
+    $('avatar').hidden = !user?.avatar_url;
+    if (user?.avatar_url) $('avatar').src = user.avatar_url;
   }
 
-  // Runs fn now if logged in, otherwise after a successful login.
-  function requireLogin(fn) {
-    if (user) return fn();
-    afterLogin = fn;
-    openAuth('login');
-  }
-
-  let authMode = 'login';
-  function openAuth(mode) {
-    authMode = mode;
-    [...$('auth-mode').children].forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
-    $('auth-submit').textContent = mode === 'login' ? 'Log in' : 'Create account';
-    $('auth-form').password.autocomplete = mode === 'login' ? 'current-password' : 'new-password';
-    $('auth-error').textContent = '';
-    $('auth-dialog').showModal();
-  }
-  $('auth-mode').addEventListener('click', (e) => { if (e.target.dataset.mode) openAuth(e.target.dataset.mode); });
-  $('login').addEventListener('click', () => openAuth('login'));
-  $('auth-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const f = e.target;
-    try {
-      const { user: u } = await api('POST', `/api/auth/${authMode}`, { username: f.username.value, password: f.password.value });
-      const next = afterLogin; afterLogin = null;
-      setUser(u);
-      f.reset();
-      $('auth-dialog').close();
-      if (next) next(); else route();
-    } catch (err) {
-      $('auth-error').textContent = err.message;
+  // Sends the user to Google and brings them back to the current page.
+  function signIn() {
+    if (!googleLogin) {
+      notice('Sign-in is not configured on this server yet.');
+      return;
     }
-  });
+    location.href = `/auth/google/login?next=${encodeURIComponent(location.pathname + location.hash)}`;
+  }
+
+  // Runs fn now if signed in; otherwise signs in first. onRedirect can save state before leaving.
+  function requireLogin(fn, onRedirect) {
+    if (user) return fn();
+    if (googleLogin && onRedirect) onRedirect();
+    signIn();
+  }
+
+  $('login').addEventListener('click', signIn);
   $('logout').addEventListener('click', async () => {
     await api('POST', '/api/auth/logout').catch(() => {});
     setUser(null);
     if (location.hash.startsWith('#/mine')) location.hash = '#/'; else route();
   });
+  $('whoami').addEventListener('click', async () => {
+    const name = prompt('Choose a username (3-24 letters, digits or _):', user.username);
+    if (!name || name === user.username) return;
+    try {
+      const { user: u } = await api('PATCH', '/api/me', { username: name });
+      setUser(u);
+      notice(`You are now ${u.username}.`);
+    } catch (err) { notice(err.message); }
+  });
 
   document.querySelectorAll('dialog').forEach((d) => {
     d.addEventListener('click', (e) => { if (e.target.closest('[data-close]')) d.close(); });
-    d.addEventListener('close', () => { if (d.id === 'auth-dialog') afterLogin = null; });
   });
 
   // ---------- Router ----------
@@ -135,7 +140,7 @@
           t.favorite = on;
           fav.textContent = on ? '★' : '☆';
           fav.setAttribute('aria-pressed', on);
-        } catch (err) { alert(err.message); }
+        } catch (err) { notice(err.message); }
       });
     });
     const card = el('a', { className: 'card', href: `#/editor/${t.id}` },
@@ -147,7 +152,7 @@
       del.addEventListener('click', async (e) => {
         e.preventDefault();
         if (!confirm(`Delete template "${t.name}"?`)) return;
-        try { await api('DELETE', `/api/templates/${t.id}`); card.remove(); } catch (err) { alert(err.message); }
+        try { await api('DELETE', `/api/templates/${t.id}`); card.remove(); } catch (err) { notice(err.message); }
       });
       card.append(del);
     }
@@ -241,13 +246,37 @@
     }));
   }
 
+  // Editor drafts survive the round trip to Google's sign-in page.
+  const DRAFT_KEY = 'meme-draft';
+  function saveDraft(action) {
+    if (!ed.template?.id) return;
+    try {
+      sessionStorage.setItem(DRAFT_KEY, JSON.stringify({ templateId: ed.template.id, layers: ed.layers, style: ed.style, action }));
+    } catch { /* storage unavailable: the draft is simply lost */ }
+  }
+  function takeDraft(templateId) {
+    try {
+      const d = JSON.parse(sessionStorage.getItem(DRAFT_KEY));
+      sessionStorage.removeItem(DRAFT_KEY);
+      return d && d.templateId === templateId ? d : null;
+    } catch { return null; }
+  }
+
   function startEditor(src, template) {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => {
+      const draft = template.id ? takeDraft(template.id) : null;
       ed.image = img;
       ed.template = template;
-      ed.layers = defaultLayers(template.box_count);
+      ed.layers = draft?.layers || defaultLayers(template.box_count);
+      if (draft?.style) {
+        Object.assign(ed.style, draft.style);
+        $('font').value = ed.style.font;
+        $('color').value = ed.style.color;
+        $('stroke').value = ed.style.stroke;
+        $('uppercase').checked = ed.style.uppercase;
+      }
       ed.active = 0;
       // Cap working resolution so huge images stay snappy and uploads stay small.
       const scale = Math.min(1, 1200 / Math.max(img.naturalWidth, img.naturalHeight));
@@ -258,6 +287,7 @@
       renderLayers();
       draw();
       window.scrollTo(0, 0);
+      if (draft?.action === 'save' && user) openSaveDialog();
     };
     img.onerror = () => { $('editor-status').textContent = 'Could not load that image.'; };
     img.src = src;
@@ -404,12 +434,13 @@
   });
 
   // Save & share
-  $('open-save').addEventListener('click', () => requireLogin(() => {
+  function openSaveDialog() {
     $('save-form').hidden = false;
     $('save-result').hidden = true;
     $('save-error').textContent = '';
     $('save-dialog').showModal();
-  }));
+  }
+  $('open-save').addEventListener('click', () => requireLogin(openSaveDialog, () => saveDraft('save')));
   $('save-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const f = e.target;
@@ -476,7 +507,7 @@
         const r = await api(m.liked ? 'DELETE' : 'PUT', `/api/memes/${m.id}/like`);
         m.liked = r.liked; m.likes = r.likes;
         renderLike();
-      } catch (err) { alert(err.message); }
+      } catch (err) { notice(err.message); }
     }));
 
     const meta = el('div', { className: 'meme-meta' },
@@ -491,7 +522,7 @@
       const del = el('button', { className: 'btn link danger', textContent: 'Delete' });
       del.addEventListener('click', async () => {
         if (!confirm('Delete this meme? Its share link will stop working.')) return;
-        try { await api('DELETE', `/api/memes/${m.id}`); card.remove(); } catch (err) { alert(err.message); }
+        try { await api('DELETE', `/api/memes/${m.id}`); card.remove(); } catch (err) { notice(err.message); }
       });
       meta.append(del);
     }
@@ -508,8 +539,13 @@
   $('feed-more').addEventListener('click', () => loadFeed(fq.mode, false));
 
   // ---------- Boot ----------
+  const params = new URLSearchParams(location.search);
+  if (params.has('login')) {
+    if (params.get('login') === 'failed') notice('Google sign-in failed. Please try again.');
+    history.replaceState(null, '', location.pathname + location.hash);
+  }
   api('GET', '/api/me')
-    .then(({ user: u }) => setUser(u))
+    .then(({ user: u, google_login: g }) => { googleLogin = g; setUser(u); })
     .catch(() => setUser(null))
     .finally(route);
 })();

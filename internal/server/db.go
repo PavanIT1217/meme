@@ -13,10 +13,12 @@ import (
 
 const schema = `
 CREATE TABLE IF NOT EXISTS users (
-	id            INTEGER PRIMARY KEY,
-	username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
-	password_hash TEXT NOT NULL,
-	created_at    INTEGER NOT NULL
+	id         INTEGER PRIMARY KEY,
+	username   TEXT NOT NULL UNIQUE COLLATE NOCASE,
+	google_sub TEXT NOT NULL UNIQUE,      -- stable Google account ID ("sub" claim)
+	email      TEXT NOT NULL DEFAULT '',
+	avatar_url TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -83,6 +85,15 @@ func openDB(path string) (*sql.DB, error) {
 	}
 	// SQLite allows one writer at a time; a single connection keeps things simple and safe.
 	db.SetMaxOpenConns(1)
+	var legacy bool
+	if err := db.QueryRow(`SELECT EXISTS (SELECT 1 FROM pragma_table_info('users') WHERE name = 'password_hash')`).Scan(&legacy); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if legacy {
+		db.Close()
+		return nil, fmt.Errorf("%s was created by an older version that used password accounts; delete it (and the uploads directory) to start fresh with Google sign-in", path)
+	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
