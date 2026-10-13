@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/png"
 	"io"
+	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
@@ -16,8 +17,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"testing/fstest"
 	"time"
+
+	"github.com/pavanit1217/meme"
 )
 
 func newTestServer(t *testing.T, opts ...func(*Config)) *httptest.Server {
@@ -27,7 +29,7 @@ func newTestServer(t *testing.T, opts ...func(*Config)) *httptest.Server {
 	cfg := Config{
 		DBPath:    filepath.Join(dir, "test.db"),
 		UploadDir: filepath.Join(dir, "uploads"),
-		Static:    fstest.MapFS{"index.html": {Data: []byte("<h1>home</h1>")}},
+		Web:       webFS(t),
 		Limits:    DefaultLimits(),
 		Google: GoogleConfig{
 			ClientID: "test-client", ClientSecret: "test-secret",
@@ -44,6 +46,15 @@ func newTestServer(t *testing.T, opts ...func(*Config)) *httptest.Server {
 	ts := httptest.NewServer(s)
 	t.Cleanup(func() { ts.Close(); s.Close() })
 	return ts
+}
+
+// webFS is the real embedded frontend, so page templates are exercised by the tests.
+func webFS(t *testing.T) fs.FS {
+	sub, err := fs.Sub(meme.Web, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sub
 }
 
 func withAdmins(names ...string) func(*Config) { return func(c *Config) { c.Admins = names } }
@@ -463,7 +474,7 @@ func TestStaticAndUnknownAPI(t *testing.T) {
 	ts := newTestServer(t)
 	res, _ := http.Get(ts.URL + "/")
 	body, _ := io.ReadAll(res.Body)
-	if !strings.Contains(string(body), "home") {
+	if res.StatusCode != 200 || !strings.Contains(string(body), "<h1>Meme Generator</h1>") {
 		t.Fatalf("index not served: %s", body)
 	}
 	if res, _ := http.Get(ts.URL + "/api/nope"); res.StatusCode != 404 ||

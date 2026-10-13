@@ -8,6 +8,7 @@ A meme generator with a Go backend: browse a template library, add draggable tex
 - **Save & share**: saved memes get a short link (`/m/abc123`) with Open Graph tags, so they unfurl with a preview in chat apps and social media. Memes can be *public* (in the feed) or *unlisted* (link only).
 - **Public feed** with New / Top sorting and likes.
 - **Sign in with Google**: accounts are created on first sign-in (server-side OAuth code flow with PKCE, HttpOnly session cookies). Usernames start from the Google name and can be changed. "My memes", favourite templates, delete your own memes and templates. Usernames listed in `ADMIN_USERS` can delete anything. Browsing works without signing in.
+- **SEO-ready, server-rendered pages**: every template has its own indexable page (`/templates/12/drake-hotline-bling`) with an editor, description, how-to and related templates; plus tag pages, feeds and meme pages. Titles, meta descriptions, canonical URLs, Open Graph/Twitter cards, JSON-LD structured data, `robots.txt`, an image sitemap, gzip, cached thumbnails and fingerprinted assets (see [SEO](#seo)).
 - **Rate limiting** per client IP (all API calls, sign-in) and per user (saving memes, uploading templates, likes and other writes). Over-limit requests get `429` with a `Retry-After` header.
 
 ## Set up Google sign-in
@@ -27,7 +28,7 @@ Requires Go 1.24+. No C compiler is needed (uses the pure-Go `modernc.org/sqlite
 
 ```sh
 go run ./cmd/server            # http://localhost:8080
-go run ./cmd/server -web web   # serve frontend files from disk while editing them
+go run ./cmd/server -web web   # load frontend files from disk instead of the embedded copy (restart to pick up edits)
 go test ./...
 ```
 
@@ -57,6 +58,28 @@ Data lives in `data/` (`meme.db` plus `uploads/`) by default.
 
 Defaults live in `DefaultLimits()` in `internal/server/ratelimit.go`. Counters are in memory, so they reset on restart and are per server instance.
 
+## SEO
+Pages are rendered on the server, so search engines see the full content without running JavaScript; `web/static/app.js` then adds the interactive parts.
+
+| URL | Page | Indexed |
+|---|---|---|
+| `/` | Template gallery with "how to make a meme" copy; `?page=N` pagination | yes (`?q=` / `?sort=` searches are `noindex`) |
+| `/templates/{id}/{slug}` | Template page: editor, description, how-to, memes made with it, related templates. `/templates/{id}` and outdated slugs 301 to the canonical URL | yes |
+| `/tags/{tag}` | Templates with a tag | yes |
+| `/feed`, `/feed/top` | Latest / most-liked public memes | yes |
+| `/m/{id}` | A meme: image, author, likes, share links, more memes | public memes yes, unlisted `noindex` |
+| `/editor`, `/me/memes` | Edit your own image, your memes | `noindex` |
+| anything else | Real `404` status with links back into the site | `noindex` |
+
+Every page has a unique `<title>` and meta description, a canonical URL, `rel=prev/next` pagination links, Open Graph and Twitter card tags (meme and template images become the preview image), breadcrumbs, and schema.org JSON-LD (`WebSite` with a sitelinks search box, `Organization`, `BreadcrumbList`, `ItemList`, `CollectionPage`, and `ImageObject` for templates and memes).
+
+- `GET /robots.txt` keeps crawlers out of `/api/`, `/auth/`, `/me/` and `/editor`, and points at the sitemap.
+- `GET /sitemap.xml` lists the home and feed pages, every tag and template page, and public memes (newest first, up to 50,000 URLs), with Google image-sitemap entries.
+- `GET /manifest.webmanifest`, `/favicon.ico`, `/apple-touch-icon.png` and a default social preview image (`web/static/og-default.png`).
+- Performance (Core Web Vitals): gzip for text responses; `/static/*` assets are fingerprinted (`?v=<hash>`) and cached for a year; galleries use cached JPEG thumbnails from `/thumbs/...` (generated on first request into `UPLOAD_DIR/thumbs`); images carry width/height to avoid layout shift. Lighthouse (mobile) scores 100 for performance, accessibility and SEO on the home, template, feed and meme pages.
+
+**Set `BASE_URL` in production** so canonical URLs, the sitemap and preview images use your real domain. Then submit `https://YOUR-DOMAIN/sitemap.xml` in Google Search Console and Bing Webmaster Tools.
+
 ## Deploy
 The frontend is embedded in the binary, so you deploy one executable plus a persistent data directory.
 
@@ -80,7 +103,7 @@ All responses are JSON. Write endpoints need a session cookie (sign in first).
 | `PATCH /api/me` | `{username}`: change your username |
 | `GET /api/templates?q=&tag=&sort=popular\|new\|name&favorites=1&mine=1&limit=&offset=` | List/search templates |
 | `GET /api/templates/{id}` | One template |
-| `POST /api/templates` | Multipart: `image`, `name`, `tags`, `box_count` |
+| `POST /api/templates` | Multipart: `image`, `name`, `description`, `tags`, `box_count` |
 | `DELETE /api/templates/{id}` | Uploader or admin |
 | `PUT` / `DELETE /api/templates/{id}/favorite` | Favourite / unfavourite |
 | `GET /api/tags` | Most used tags |
@@ -89,11 +112,12 @@ All responses are JSON. Write endpoints need a session cookie (sign in first).
 | `GET /api/memes/{id}`, `DELETE /api/memes/{id}` | View; delete (owner or admin) |
 | `PUT` / `DELETE /api/memes/{id}/like` | Like / unlike |
 | `GET /api/me/memes` | Your memes, including unlisted |
-| `GET /m/{id}` | Shareable HTML page for a meme |
+| `GET /m/{id}` | Shareable HTML page for a meme (see [SEO](#seo) for all pages) |
 
 ## Project layout
 ```
 cmd/server/        entry point (flags, seeding, graceful shutdown)
-internal/server/   HTTP handlers, SQLite schema, auth, uploads, share pages, tests
-web/               frontend (index.html, app.js, style.css), embedded via web.go
+internal/server/   HTTP handlers, server-rendered pages and SEO, SQLite schema, auth, uploads, thumbnails, tests
+web/templates/     server-rendered page templates (page.html)
+web/static/        app.js, style.css, icons, default social preview image; embedded via web.go
 ```

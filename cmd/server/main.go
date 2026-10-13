@@ -29,7 +29,7 @@ func main() {
 	addr := flag.String("addr", env("ADDR", ":"+env("PORT", "8080")), "listen address (env ADDR or PORT)")
 	dbPath := flag.String("db", env("DB_PATH", "data/meme.db"), "SQLite database path (env DB_PATH)")
 	uploadDir := flag.String("uploads", env("UPLOAD_DIR", "data/uploads"), "directory for uploaded images (env UPLOAD_DIR)")
-	webDir := flag.String("web", "", "serve the frontend from this directory instead of the embedded copy (for development)")
+	webDir := flag.String("web", "", "load the frontend from this directory instead of the embedded copy (for development; restart to pick up changes)")
 	seed := flag.Bool("seed", true, "import Imgflip's popular templates when the library is empty")
 	flag.Parse()
 
@@ -39,15 +39,15 @@ func main() {
 		admins = strings.Split(v, ",")
 	}
 
-	var static fs.FS
+	var web fs.FS
 	if *webDir != "" {
-		static = os.DirFS(*webDir)
+		web = os.DirFS(*webDir)
 	} else {
 		sub, err := fs.Sub(meme.Web, "web")
 		if err != nil {
 			log.Fatal(err)
 		}
-		static = sub
+		web = sub
 	}
 
 	srv, err := server.New(server.Config{
@@ -62,7 +62,7 @@ func main() {
 			ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
 		},
 		Limits: server.DefaultLimits(),
-		Static: static,
+		Web:    web,
 	})
 	if err != nil {
 		log.Fatal(err)

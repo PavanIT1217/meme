@@ -12,6 +12,7 @@ type memeJSON struct {
 	ID           string `json:"id"`
 	Title        string `json:"title"`
 	ImageURL     string `json:"image_url"`
+	ThumbURL     string `json:"thumb_url"` // small JPEG for feed cards
 	Width        int    `json:"width"`
 	Height       int    `json:"height"`
 	Public       bool   `json:"public"`
@@ -20,6 +21,7 @@ type memeJSON struct {
 	Author       string `json:"author"`
 	TemplateID   *int64 `json:"template_id"`
 	TemplateName string `json:"template_name,omitempty"`
+	TemplateURL  string `json:"template_url,omitempty"`
 	CanDelete    bool   `json:"can_delete"`
 	ShareURL     string `json:"share_url"`
 	CreatedAt    int64  `json:"created_at"`
@@ -42,34 +44,41 @@ func scanMeme(row interface{ Scan(...any) error }, viewer *User) (memeJSON, erro
 		&userID, &m.Author, &tmplID, &m.TemplateName, &m.CreatedAt)
 	if tmplID.Valid {
 		m.TemplateID = &tmplID.Int64
+		m.TemplateURL = templatePath(tmplID.Int64, m.TemplateName)
 	}
 	m.ShareURL = "/m/" + m.ID
+	m.ThumbURL = thumbURL("memes", m.ID, memeThumbWidth)
 	m.CanDelete = viewer != nil && (viewer.IsAdmin || viewer.ID == userID)
 	return m, err
 }
 
-func (s *Server) queryMemes(w http.ResponseWriter, viewer *User, where string, order string, args ...any) {
-	var viewerID int64
-	if viewer != nil {
-		viewerID = viewer.ID
-	}
+const (
+	feedNew = "m.created_at DESC, m.id"
+	feedTop = "m.like_count DESC, m.created_at DESC, m.id"
+)
+
+// listMemes runs memeSelect with a WHERE clause and ORDER BY; args must end with limit and offset.
+func (s *Server) listMemes(viewer *User, where, order string, args ...any) ([]memeJSON, error) {
 	rows, err := s.db.Query(memeSelect+` WHERE `+where+` ORDER BY `+order+` LIMIT ? OFFSET ?`,
-		append([]any{viewerID}, args...)...)
+		append([]any{viewerID(viewer)}, args...)...)
 	if err != nil {
-		serverError(w, err)
-		return
+		return nil, err
 	}
 	defer rows.Close()
 	list := []memeJSON{}
 	for rows.Next() {
 		m, err := scanMeme(rows, viewer)
 		if err != nil {
-			serverError(w, err)
-			return
+			return nil, err
 		}
 		list = append(list, m)
 	}
-	if err := rows.Err(); err != nil {
+	return list, rows.Err()
+}
+
+func (s *Server) writeMemes(w http.ResponseWriter, viewer *User, where, order string, args ...any) {
+	list, err := s.listMemes(viewer, where, order, args...)
+	if err != nil {
 		serverError(w, err)
 		return
 	}
@@ -84,24 +93,20 @@ func (s *Server) handleListMemes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit, offset := pagination(r, 30, 100)
-	order := "m.created_at DESC, m.id"
+	order := feedNew
 	if r.URL.Query().Get("sort") == "top" {
-		order = "m.like_count DESC, m.created_at DESC, m.id"
+		order = feedTop
 	}
-	s.queryMemes(w, viewer, "m.is_public = 1", order, limit, offset)
+	s.writeMemes(w, viewer, "m.is_public = 1", order, limit, offset)
 }
 
 func (s *Server) handleMyMemes(w http.ResponseWriter, r *http.Request, u *User) {
 	limit, offset := pagination(r, 30, 100)
-	s.queryMemes(w, u, "m.user_id = ?", "m.created_at DESC, m.id", u.ID, limit, offset)
+	s.writeMemes(w, u, "m.user_id = ?", feedNew, u.ID, limit, offset)
 }
 
 func (s *Server) getMeme(id string, viewer *User) (memeJSON, error) {
-	var viewerID int64
-	if viewer != nil {
-		viewerID = viewer.ID
-	}
-	m, err := scanMeme(s.db.QueryRow(memeSelect+` WHERE m.id = ?`, viewerID, id), viewer)
+	m, err := scanMeme(s.db.QueryRow(memeSelect+` WHERE m.id = ?`, viewerID(viewer), id), viewer)
 	if errors.Is(err, sql.ErrNoRows) {
 		return m, errNotFound
 	}
@@ -221,6 +226,7 @@ func (s *Server) handleDeleteMeme(w http.ResponseWriter, r *http.Request, u *Use
 		return
 	}
 	s.removeUpload(m.ImageURL)
+	s.removeThumbs("memes", m.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

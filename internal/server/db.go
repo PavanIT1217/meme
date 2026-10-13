@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS templates (
 	id          INTEGER PRIMARY KEY,
 	name        TEXT NOT NULL,
+	description TEXT NOT NULL DEFAULT '',
 	image_url   TEXT NOT NULL,
 	width       INTEGER NOT NULL,
 	height      INTEGER NOT NULL,
@@ -98,7 +99,25 @@ func openDB(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	return db, nil
+}
+
+// migrate adds columns introduced after a database was first created.
+func migrate(db *sql.DB) error {
+	var has bool
+	if err := db.QueryRow(`SELECT EXISTS (SELECT 1 FROM pragma_table_info('templates') WHERE name = 'description')`).Scan(&has); err != nil {
+		return err
+	}
+	if !has {
+		if _, err := db.Exec(`ALTER TABLE templates ADD COLUMN description TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func now() int64 { return time.Now().Unix() }

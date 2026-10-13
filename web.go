@@ -3,7 +3,7 @@ package meme
 
 import "embed"
 
-// Web is the static frontend (index.html, app.js, style.css).
+// Web is the frontend: static/ (JS, CSS, icons) and templates/ (server-rendered page templates).
 //
 //go:embed web
 var Web embed.FS
