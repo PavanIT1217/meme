@@ -1,4 +1,4 @@
-// Package server implements the Meme Forge HTTP API, share pages and static file serving.
+// Package server implements the Meme Forge HTTP API, server-rendered pages and static file serving.
 package server
 
 import (
@@ -27,16 +27,17 @@ type Config struct {
 	TrustProxy    bool     // take client IPs from X-Forwarded-For (only behind a reverse proxy)
 	Google        GoogleConfig
 	Limits        Limits
-	Static        fs.FS // frontend files
+	Web           fs.FS // frontend: static/ (assets) and templates/ (page templates)
 }
 
 type Server struct {
-	cfg       Config
-	db        *sql.DB
-	admins    map[string]bool
-	handler   http.Handler
-	shareTmpl *template.Template
-	limit     limiters
+	cfg     Config
+	db      *sql.DB
+	admins  map[string]bool
+	handler http.Handler
+	pages   *template.Template
+	static  map[string]staticFile
+	limit   limiters
 }
 
 func New(cfg Config) (*Server, error) {
@@ -51,10 +52,9 @@ func New(cfg Config) (*Server, error) {
 		}
 	}
 	s := &Server{
-		cfg:       cfg,
-		db:        db,
-		admins:    map[string]bool{},
-		shareTmpl: template.Must(template.New("share").Parse(sharePageHTML)),
+		cfg:    cfg,
+		db:     db,
+		admins: map[string]bool{},
 		limit: limiters{
 			api:      newLimiter(cfg.Limits.API, time.Now),
 			auth:     newLimiter(cfg.Limits.Auth, time.Now),
@@ -68,7 +68,15 @@ func New(cfg Config) (*Server, error) {
 			s.admins[a] = true
 		}
 	}
-	s.handler = s.middleware(s.routes())
+	if s.static, err = loadStatic(cfg.Web); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("load static files: %w", err)
+	}
+	if err := s.loadPageTemplates(cfg.Web); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("parse page templates: %w", err)
+	}
+	s.handler = withGzip(s.middleware(s.routes()))
 	return s, nil
 }
 
@@ -111,7 +119,24 @@ func (s *Server) routes() http.Handler {
 		writeError(w, http.StatusNotFound, "not found")
 	})
 
-	m.HandleFunc("GET /m/{id}", s.handleSharePage)
+	// Server-rendered, indexable pages.
+	m.HandleFunc("GET /{$}", s.handleHome)
+	m.HandleFunc("GET /tags/{tag}", s.handleTagPage)
+	m.HandleFunc("GET /templates/{id}", s.handleTemplateRedirect)
+	m.HandleFunc("GET /templates/{id}/{slug}", s.handleTemplatePage)
+	m.HandleFunc("GET /feed", s.handleFeedPage("new"))
+	m.HandleFunc("GET /feed/top", s.handleFeedPage("top"))
+	m.HandleFunc("GET /m/{id}", s.handleMemePage)
+	m.HandleFunc("GET /editor", s.handleEditorPage)
+	m.HandleFunc("GET /me/memes", s.handleMinePage)
+
+	m.HandleFunc("GET /robots.txt", s.handleRobots)
+	m.HandleFunc("GET /sitemap.xml", s.handleSitemap)
+	m.HandleFunc("GET /manifest.webmanifest", s.handleManifest)
+	m.HandleFunc("GET /favicon.ico", s.staticAt("favicon.ico"))
+	m.HandleFunc("GET /apple-touch-icon.png", s.staticAt("apple-touch-icon.png"))
+	m.HandleFunc("GET /static/{file...}", s.handleStatic)
+	m.HandleFunc("GET /thumbs/{kind}/{name}", s.handleThumb)
 
 	uploads := http.StripPrefix("/uploads/", http.FileServer(http.Dir(s.cfg.UploadDir)))
 	m.Handle("GET /uploads/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -125,7 +150,7 @@ func (s *Server) routes() http.Handler {
 		uploads.ServeHTTP(w, r)
 	}))
 
-	m.Handle("/", http.FileServerFS(s.cfg.Static))
+	m.HandleFunc("/", s.handleNotFound)
 	return m
 }
 

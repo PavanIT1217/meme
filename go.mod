@@ -3,6 +3,7 @@ module github.com/pavanit1217/meme
 go 1.24
 
 require (
+	golang.org/x/image v0.29.0
 	golang.org/x/oauth2 v0.30.0
 	modernc.org/sqlite v1.38.2
 )
